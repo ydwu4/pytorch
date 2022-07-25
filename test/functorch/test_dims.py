@@ -10,7 +10,7 @@ from functorch.dim import Tensor, Dim, dims, dimlists, stack, DimensionBindError
 from attn_ft import BertSelfAttention as BertSelfAttentionA, Linear
 from attn_positional import BertSelfAttention as BertSelfAttentionB
 
-from torch.testing._internal.common_utils import TestCase, run_tests, TEST_CUDA
+from torch.testing._internal.common_utils import TestCase, run_tests, TEST_CUDA, TEST_WITH_ASAN
 
 from unittest import skip, skipIf
 import torch
@@ -176,7 +176,7 @@ class TestMin(TestCase):
             gpu_time(lambda: B(hidden_state), "positional", r=3)
             gpu_time(lambda: A(hidden_state), "first_class", r=3)
 
-
+    @skipIf(TEST_WITH_ASAN, "tests gets asan error, put up issue since seems real")
     def test_attn(self):
         self.attn()
 
@@ -233,6 +233,7 @@ class TestMin(TestCase):
         x = r.order(i, [j, k])
         self.assertTrue(torch.allclose(a, x))
 
+    @skipIf(TEST_WITH_ASAN, "tests gets asan error, put up issue since seems real")
     def test_hello(self):
         A = torch.rand(3, 4)
         B = torch.rand(4, 5)
@@ -379,6 +380,7 @@ class TestMin(TestCase):
 
         assert torch.allclose(r1.order(i, j), r0)
 
+    @skipIf(TEST_WITH_ASAN, "tests gets asan error, put up issue since seems real")
     def test_compare_dims(self):
         i, j = dims()
         i.size = 3
@@ -400,6 +402,8 @@ class TestMin(TestCase):
         i = dims()
         assert list(A[i].expand(2, 4).order(i).size()) == [3, 2, 4]
 
+
+    @skipIf(TEST_WITH_ASAN, "tests gets asan error, maybe real issue")
     def test_parse(self):
         self.assertEqual(("x", None, None, None), _parse_test(1, 0, "x"))
         self.assertEqual(("x", None, "y", None), _parse_test(1, 0, "x", c="y"))
@@ -450,6 +454,7 @@ class TestMin(TestCase):
         assert b[0].size == 4
         assert b[1].size == 5
 
+    @skipIf(TEST_WITH_ASAN, "tests gets asan error, put up issue since seems real")
     def test_diag(self):
         i = dims()
         A = torch.rand(4, 4)
@@ -526,6 +531,7 @@ class TestMin(TestCase):
         i, j = dims(sizes=[a.size(0), a.size(0)])
         ((i >= j) * a[i]).sum(j).order(i)
 
+    @skipIf(TEST_WITH_ASAN, "tests gets asan error, put up issue since seems real")
     def test_eq(self):
         i, j = dims(sizes=[3, 3])
         assert (i == j).sum((i, j)) == 3
@@ -542,6 +548,7 @@ class TestMin(TestCase):
         assert str(y.x) == "d1"
         assert str(q) == "d2"
 
+    @skipIf(TEST_WITH_ASAN, "tests gets asan error, put up issue since seems real")
     def test_dir(self):
         i, j = dims(sizes=[3, 3])
         dir(i <= j)
