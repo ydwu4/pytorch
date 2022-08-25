@@ -606,12 +606,12 @@ PyObject* THPModule_setWarnAlways(PyObject* _unused, PyObject* arg) {
       "setWarnOnlyOnce expects a bool, "
       "but got %s",
       THPUtils_typename(arg));
-  c10::Warning::set_warnAlways(arg == Py_True);
+  c10::WarningUtils::set_warnAlways(arg == Py_True);
   Py_RETURN_NONE;
 }
 
 PyObject* THPModule_warnAlways(PyObject* _unused, PyObject* noargs) {
-  if (c10::Warning::get_warnAlways()) {
+  if (c10::WarningUtils::get_warnAlways()) {
     Py_RETURN_TRUE;
   }
   Py_RETURN_FALSE;
