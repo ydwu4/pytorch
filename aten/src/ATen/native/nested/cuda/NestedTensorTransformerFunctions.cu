@@ -460,6 +460,7 @@ template void add_padding_kernelLauncher<c10::Half>(
 
 namespace {
 
+#ifndef USE_ROCM
 template <typename scalar_t>
 void gemm_grouped_cuda_internal(
     const std::vector<int64_t>& lda,
@@ -588,6 +589,7 @@ void gemm_grouped_cuda_internal(
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+#endif
 
 } // namespace
 
