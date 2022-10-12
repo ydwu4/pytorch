@@ -429,6 +429,7 @@ cu_library(
         "@cuda//:cublas",
         "@cuda//:cufft",
         "@cuda//:cusparse",
+        "@cutlass",
     ],
     alwayslink = True,
 )
