@@ -347,7 +347,8 @@ __global__ void add_padding_3(
     const int i0 = i / (output_sizes_2 * output_sizes_3);
     const int i1 = (i % (output_sizes_2 * output_sizes_3)) / output_sizes_3;
     const int i2 = i % output_sizes_3;
-    if (batch_id < batch_size && i0 < sizes_i[0] && i1 < sizes_i[1] && i2 < sizes_i[2]) {
+    if (batch_id < batch_size && i0 < sizes_i[0] && i1 < sizes_i[1] &&
+        i2 < sizes_i[2]) {
       const int offset = offsets[batch_id];
       const int input_offset =
           offset + i0 * (sizes_i[1] * sizes_i[2]) + i1 * sizes_i[2] + i2;
@@ -361,7 +362,8 @@ __global__ void add_padding_3(
     const int i0 = i / (output_sizes_2 * output_sizes_3);
     const int i1 = (i % (output_sizes_2 * output_sizes_3)) / output_sizes_3;
     const int i2 = i % output_sizes_3;
-    if (batch_id < batch_size && i0 < sizes_i[0] && i1 < sizes_i[1] && i2 < sizes_i[2]) {
+    if (batch_id < batch_size && i0 < sizes_i[0] && i1 < sizes_i[1] &&
+        i2 < sizes_i[2]) {
       const int offset = offsets[batch_id];
       const int input_offset =
           offset + i0 * (sizes_i[1] * sizes_i[2]) + i1 * sizes_i[2] + i2;
@@ -620,8 +622,8 @@ Tensor bmm_nested_cuda(const Tensor& self, const Tensor& mat2) {
                            mat2_sizes = NestedTensor_get_sizes(mat2_ptr),
                            self_strides = NestedTensor_get_strides(self_ptr),
                            mat2_strides = NestedTensor_get_strides(mat2_ptr);
-  const std::vector<int64_t>&self_offsets = self_ptr->get_offsets(),
-        &mat2_offsets = mat2_ptr->get_offsets();
+  const std::vector<int64_t>& self_offsets = self_ptr->get_storage_offsets();
+  const std::vector<int64_t>& mat2_offsets = mat2_ptr->get_storage_offsets();
 
   // create a contiguous output
   int64_t out_numel = 0;
@@ -711,8 +713,7 @@ Tensor bmm_nested_cuda(const Tensor& self, const Tensor& mat2) {
   for (int64_t i = 0; i < ntensors; i++) {
     at::mm_out(
         output_unbind[i],
-        self_buffer.as_strided(
-            self_sizes[i], self_strides[i], self_offsets[i]),
+        self_buffer.as_strided(self_sizes[i], self_strides[i], self_offsets[i]),
         mat2_buffer.as_strided(
             mat2_sizes[i], mat2_strides[i], mat2_offsets[i]));
   }
