@@ -638,7 +638,9 @@ Tensor bmm_nested_cuda(const Tensor& self, const Tensor& mat2) {
   std::vector<int64_t> lda;
   std::vector<int64_t> ldb;
   std::vector<int64_t> ldd;
+#ifndef USE_ROCM
   std::vector<cutlass::gemm::GemmCoord> gemm_sizes;
+#endif
   bool all_row_major = true;
   for (int64_t i = 0; i < ntensors; i++) {
     const IntArrayRef &self_shape = self_sizes[i], &mat2_shape = mat2_sizes[i];
@@ -661,8 +663,10 @@ Tensor bmm_nested_cuda(const Tensor& self, const Tensor& mat2) {
     out_sizemat_ptr += 2;
     output_offsets.push_back(out_numel);
     out_numel += self_size0 * mat2_size1;
+#ifndef USE_ROCM
     gemm_sizes.push_back(
         cutlass::gemm::GemmCoord(self_size0, mat2_size1, self_size1));
+#endif
     lda.push_back(self_strides[i][0]);
     ldb.push_back(mat2_strides[i][0]);
     ldd.push_back(mat2_size1);
