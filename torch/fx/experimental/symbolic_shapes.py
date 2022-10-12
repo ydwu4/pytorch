@@ -2,6 +2,7 @@ import torch
 import torch.utils._pytree as pytree
 from typing import Set, Dict, List, Type, Optional, cast
 import operator
+import builtins
 import math
 import functools
 from functools import lru_cache, partial
@@ -228,8 +229,12 @@ def _make_magic(method, func, py_type):
     func = lru_cache(256)(func)
 
     def magic_impl(self, other):
+        if method in ["min", "max"]:
+            op = getattr(builtins, method)
+        else:
+            op = getattr(operator, method)
         if SYM_FUNCTION_MODE:
-            return _handle_sym_dispatch(getattr(operator, method), (self, other), {})
+            return _handle_sym_dispatch(op, (self, other), {})
         if isinstance(other, py_type):
             other = other.expr
         # TODO: consider constant prop here
@@ -245,11 +250,11 @@ def _make_magic(method, func, py_type):
             return py_type(out, self.shape_env)
 
     def unary_magic_impl(self):
+        if method in ["ceil", "floor"]:
+            op = getattr(math, method)
+        else:
+            op = getattr(operator, method)
         if SYM_FUNCTION_MODE:
-            if method in ["ceil"]:
-                op = getattr(math, method)
-            else:
-                op = getattr(operator, method)
             return _handle_sym_dispatch(op, (self,), {})
         # TODO: consider constant prop here
         expr = self.shape_env.replace(self.expr)
