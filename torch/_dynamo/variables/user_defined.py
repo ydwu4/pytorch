@@ -106,6 +106,11 @@ class UserDefinedClassVariable(UserDefinedVariable):
         elif variables.DataClassVariable.is_matching_cls(self.value):
             options["mutable_local"] = MutableLocal()
             return variables.DataClassVariable.create(self.value, args, kwargs, options)
+        elif InstancesVariable.is_matching_cls(self.value):
+            var = tx.output.side_effects.track_object_new(
+                self.source, self.value, InstancesVariable, options
+            )
+            return var.add_options(var.call_method(tx, "__init__", args, kwargs))
 
         return super().call_function(tx, args, kwargs)
 
@@ -378,3 +383,24 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         ).add_options(
             key, self
         )
+
+
+class Detectron2InstancesVariable(UserDefinedObjectVariable):
+    """
+    Hack for Detectron2Instances. The original Instances class
+    has customized __setattr__, which prevents Dynamo to trace.
+    We add a Detectron2Instances class to bypass the limitation
+    for this specific class.
+    """
+
+    @staticmethod
+    def is_matching_cls(cls):
+        try:
+            from detectron2.structures.instances import Instances
+
+            return issubclass(cls, Instances)
+        except ImportError as e:
+            return False
+
+    def __init__(self, value, **options):
+        super(InstancesVariable, self).__init__(value, **options)
