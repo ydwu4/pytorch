@@ -1311,7 +1311,7 @@ class ShapeEnv:
             ex.storage_offset(),
             TensorPropertySource(source, TensorProperty.STORAGE_OFFSET)
         ), hint=ex.storage_offset())
-        return sym_size, sym_stride, sym_storage_offset
+        return sym_size, tuple(sym_stride), sym_storage_offset
 
     # If you know what the current hint value of the SymInt to be created
     # is, pass it into hint.  Otherwise, pass None and we will make our best
