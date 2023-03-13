@@ -24,8 +24,7 @@ Experimental implementation of JAX-like while_loop operator.
 """
 while_loop = PyOperator("while_loop")
 
-@while_loop.py_impl(DispatchKey.AutogradCUDA)
-@while_loop.py_impl(DispatchKey.AutogradCPU)
+@while_loop.py_impl(DispatchKey.Autograd)
 def while_loop_autograd(cond_fun, body_fun, init_val):
     # TODO: support autograd
     flat_operands, _ = pytree.tree_flatten([cond_fun, body_fun, init_val])
@@ -39,8 +38,7 @@ def while_loop_autograd(cond_fun, body_fun, init_val):
 while_loop.fallthrough(DispatchKey.ADInplaceOrView)
 while_loop.fallthrough(DispatchKey.BackendSelect)
 
-@while_loop.py_impl(DispatchKey.CUDA)
-@while_loop.py_impl(DispatchKey.CPU)
+@while_loop.py_impl(DispatchKey.CompositeExplicitAutograd)
 def while_loop_cpu(cond_fun, body_fun, init_val):
     mode = _get_current_dispatch_mode()
     assert (mode is None), "Mode should never be enabled for CPU/CUDA key"
