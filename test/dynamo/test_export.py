@@ -1582,7 +1582,7 @@ class ExportTests(torch._dynamo.test_case.TestCase):
 
         out_graph, _ = torch._dynamo.export(mod, pred_x, x)
         self.assertEqual(real_result, out_graph(pred_y, y))
-
+    
     @config.patch(dynamic_shapes=True)
     def test_export_with_map_zero_sized_tensor(self):
         from functorch.experimental.control_flow import map
@@ -1601,6 +1601,30 @@ class ExportTests(torch._dynamo.test_case.TestCase):
             "zero-sized tensor",
         ):
             out_graph, _ = torch._dynamo.export(mod, xs)
+        
+    def test_export_with_while_loop(self):
+        from functorch.experimental.control_flow import while_loop
+
+        class Module(torch.nn.Module):
+            def forward(self, input):
+                def cond_fun(x):
+                    iter, _ = x
+                    return iter > 0
+
+                def body_fun(x):
+                    iter, val = x
+                    return (iter - 1, val + 1)
+
+                return while_loop(cond_fun, body_fun, input)
+
+        iter = torch.tensor(5)
+        val = torch.randn(2, 3)
+        input = (iter, val)
+        mod = Module()
+
+        graph, _ = torch._dynamo.export(mod, input)
+        graph.print_readable()
+
 
     def test_export_meta_val(self):
         def f(x, y, z):

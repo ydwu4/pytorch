@@ -1004,6 +1004,47 @@ class TorchPyOperator(VariableTracker):
             example_value = r.new_empty(
                 [get_fake_value(args[1].as_proxy().node, tx).shape[0], *r.shape]
             )
+        elif self.value.__name__ == "while_loop":
+            cond_fun = args[0]
+            body_fun = args[1]
+            init_val = args[2]
+            assert type(args[0]) in (UserFunctionVariable, NestedUserFunctionVariable)
+            assert type(args[1]) in (UserFunctionVariable, NestedUserFunctionVariable)
+            checkpoint = tx.copy_graphstate()
+
+            cond_r, cond_graph, cond_guards, cond_nn_modules, cond_cmp = speculate_subgraph(cond_fun,
+            [init_val], tx.output.graph, checkpoint)
+            body_r, body_graph, body_guards, body_nn_modules, body_cmp = speculate_subgraph(body_fun,
+            [init_val], tx.output.graph, checkpoint)
+
+            parent_cmp = get_comparable_state(checkpoint)
+            def cmp_with_parent(cmp):
+                if parent_cmp != cmp:
+                    raise unimplemented(
+                        f"Graph state changed in while_loop body_fun. Diagostics: {parent_cmp.diff(cmp)}"
+                    )
+            
+            cmp_with_parent(cond_cmp)
+            cmp_with_parent(parent_cmp)
+            # Add guards
+            tx.output.tracing_context.guards_context.dynamo_guards |= cond_guards
+            tx.output.tracing_context.guards_context.dynamo_guards |= body_guards
+            cond_name = add_subgraph(
+                "cond_fun", torch.fx.GraphModule(cond_nn_modules, cond_graph)
+            )
+            body_name = add_subgraph(
+                "body_fun", torch.fx.GraphModule(body_nn_modules, body_graph)
+            )
+
+            cond_node = make_attr(cond_name)
+            body_node = make_attr(body_name)
+
+            p_args = (
+                cond_node,
+                body_node,
+                init_val.as_proxy()
+            )
+            example_value = body_r.as_proxy().node.meta["example_value"]
         else:
             unimplemented(f"PyOperator {self.value.__name__}")
 
