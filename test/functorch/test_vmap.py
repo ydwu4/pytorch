@@ -1051,6 +1051,11 @@ class TestVmapAPI(TestCase):
         y = reshape_dim_outof(-1, 6, x)
         self.assertEqual(y, x.reshape(12, 12, 6, 2))
 
+        # Case: `0` sized dim.
+        x = torch.randn(12, 12, 0)
+        y = reshape_dim_outof(-1, 6, x)
+        self.assertEqual(y.shape, torch.Size((12, 12, 6, 0)))
+
     def test_batch_rule_does_not_need_to_handle_no_batched_input(self):
         def f(x, y):
             res = torch.dot(y, torch.ones(2))
@@ -3475,6 +3480,7 @@ class TestVmapOperatorsOpInfo(TestCase):
         xfail('pca_lowrank', ''),  # random operation
         xfail('svd_lowrank', ''),  # random operation
         xfail('sparse.sampled_addmm'),  # sparse
+        xfail('sparse.mm', 'reduce'),  # sparse
         xfail("NumpyCubeNotComposableAutogradFunction"),  # Not composable autograd.Function
         skip('_softmax_backward_data'),
         skip('linalg.eigh', ''),  # not unique, see test_linalg_eigh for manual test
@@ -3595,7 +3601,6 @@ class TestVmapOperatorsOpInfo(TestCase):
     @skipOps('TestVmapOperatorsOpInfo', 'test_op_has_batch_rule', vmap_fail.union({
         xfail('as_strided', 'partial_views'),
         skip('to'),  # RuntimeError: required rank 4 tensor to use channels_last format
-        xfail('complex'),
         xfail('copysign'),
         xfail('fill'),
         # Batch norm got a batched tensor as input while the running_mean or running_var,
@@ -3701,10 +3706,11 @@ class TestVmapOperatorsOpInfo(TestCase):
         xfail('clamp_min', ''),
         xfail('special.bessel_j0'),
         xfail('sparse.sampled_addmm'),
+        xfail('sparse.mm', 'reduce'),
         xfail('special.bessel_y0'),
         xfail('special.chebyshev_polynomial_u'),
         xfail('special.modified_bessel_k1'),
-        xfail('segment_reduce', 'offsets'),
+        xfail('_segment_reduce', 'offsets'),
         xfail('special.bessel_j1'),
         xfail('index_reduce', ''),
         xfail('special.laguerre_polynomial_l'),
@@ -3712,7 +3718,7 @@ class TestVmapOperatorsOpInfo(TestCase):
         xfail('jiterator_binary', device_type='cuda'),
         xfail('special.modified_bessel_i0'),
         xfail('jiterator_4inputs_with_extra_args', device_type='cuda'),
-        xfail('segment_reduce', 'lengths'),
+        xfail('_segment_reduce', 'lengths'),
         xfail('lu_solve', ''),
         xfail('special.bessel_y1'),
         xfail('special.hermite_polynomial_he'),
@@ -3749,6 +3755,7 @@ class TestVmapOperatorsOpInfo(TestCase):
         # RuntimeError: Expected all tensors to be on the same device,
         # but found at least two devices, cuda:0 and cpu!
         xfail('ge', device_type='cuda'),
+        xfail('_upsample_bilinear2d_aa'),
     }))
     def test_op_has_batch_rule(self, device, dtype, op):
         # needs to be fixed
@@ -4256,6 +4263,7 @@ class TestVmapOperatorsOpInfo(TestCase):
         # IndexError: Dimension out of range (expected to be in range of [-1, 0], but got -2)
         # https://github.com/pytorch/pytorch/runs/8110653462?check_suite_focus=true
         # but it passes locally
+        xfail('linalg.diagonal'),
         skip('linalg.matrix_norm', ''),
         skip('linalg.ldl_solve', ''),
     })

@@ -60,6 +60,7 @@
 #include <torch/csrc/jit/serialization/pickler.h>
 #include <torch/csrc/lazy/python/init.h>
 #include <torch/csrc/monitor/python_init.h>
+#include <torch/csrc/mps/Module.h>
 #include <torch/csrc/multiprocessing/init.h>
 #include <torch/csrc/onnx/init.h>
 #include <torch/csrc/profiler/python/init.h>
@@ -85,10 +86,6 @@
 #include <torch/csrc/distributed/rpc/rpc.h>
 #include <torch/csrc/distributed/rpc/testing/testing.h>
 #endif
-#endif
-
-#if defined(USE_MPS)
-#include <ATen/mps/MPSDevice.h>
 #endif
 
 #if defined(USE_VALGRIND)
@@ -1247,11 +1244,7 @@ class WeakTensorRef {
   }
 };
 
-extern "C"
-#ifdef _WIN32
-    __declspec(dllexport)
-#endif
-        TORCH_API PyObject* initModule();
+extern "C" C10_EXPORT PyObject* initModule();
 // separate decl and defn for msvc error C2491
 PyObject* initModule() {
   HANDLE_TH_ERRORS
@@ -1271,6 +1264,7 @@ PyObject* initModule() {
   THPUtils_addPyMethodDefs(methods, DataLoaderMethods);
   THPUtils_addPyMethodDefs(methods, torch::autograd::python_functions());
   THPUtils_addPyMethodDefs(methods, torch::multiprocessing::python_functions());
+  THPUtils_addPyMethodDefs(methods, torch::mps::python_functions());
 #ifdef USE_CUDA
   THPUtils_addPyMethodDefs(methods, THCPModule_methods());
 #endif
@@ -1562,6 +1556,15 @@ Call this whenever a new thread is created in order to propagate values from
     return at::globalContext().linalgPreferredBackend();
   });
 
+  py_module.def(
+      "_construct_storage_from_data_pointer",
+      [](int64_t data_ptr, c10::Device device, size_t size_bytes) {
+        return c10::Storage(
+            c10::Storage::use_byte_size_t(),
+            size_bytes,
+            at::DataPtr(reinterpret_cast<void*>(data_ptr), device));
+      });
+
   py_module.def("_stash_obj_in_tls", [](std::string key, py::handle arg) {
     at::impl::ThreadLocalPythonObjects::get_state().set(
         key,
@@ -1593,15 +1596,6 @@ Call this whenever a new thread is created in order to propagate values from
 
   ASSERT_TRUE(set_module_attr("has_cuda", has_cuda));
   ASSERT_TRUE(set_module_attr("has_mps", has_mps));
-  py_module.def("_is_mps_available", []() { return at::hasMPS(); });
-  py_module.def("_is_mps_on_macos_13_or_newer", []() {
-#ifdef USE_MPS
-    return at::mps::is_macos_13_or_newer();
-#else
-    return false;
-#endif
-  });
-
   ASSERT_TRUE(
       set_module_attr("has_mkldnn", at::hasMKLDNN() ? Py_True : Py_False));
 

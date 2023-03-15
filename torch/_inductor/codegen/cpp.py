@@ -5,20 +5,24 @@ import math
 import sys
 from copy import copy, deepcopy
 from pathlib import Path
-from typing import Dict, List
+from typing import ClassVar, Dict, List
 
+import numpy
 import sympy
 
 import torch
+import torch.fx
 from torch._prims_common import is_float_dtype
 
 from .. import codecache, config, ir, metrics
 from ..codegen.wrapper import WrapperCodeGen
+from ..scheduler import SchedulerNode
 from ..utils import cache_on_self, sympy_product, sympy_subs, sympy_symbol
 from ..virtualized import ops, V
 from .common import (
     BracesBuffer,
     CppWrapperKernelArgs,
+    CSEVariable,
     DeferredIndentedBuffer,
     ExprPrinter,
     IndentedBuffer,
@@ -66,6 +70,10 @@ RTYPE_TO_CPP = {
 
 
 def reduction_init(reduction_type, dtype):
+    if dtype in (torch.float16, torch.bfloat16):
+        # Since load promotes all half-precision inputs to float, the initial
+        # constant for reduction must be promoted as well
+        dtype = torch.float32
     if reduction_type in ("sum", "any"):
         return 0
     if reduction_type in {"max", "argmax"}:
@@ -136,20 +144,6 @@ def argmax_argmin_prefix(reduction_type, src_dtype, tmpvar):
     return prefix
 
 
-def float16_reduction_prefix(rtype):
-    # TODO: This user-defined reduction uses float16 accumulation for sum. To reduce numerical
-    # errors, float32 accumulation should be used instead.
-    assert rtype in (
-        "sum",
-        "any",
-    ), f"float16 user-defined reduction only supports 'sum' and 'any' but got {rtype}"
-    prefix = [
-        f"#pragma omp declare reduction({RTYPE_TO_CPP[rtype]}:{DTYPE_TO_CPP[torch.float16]}:"
-        + f"omp_out = omp_out {RTYPE_TO_CPP[rtype]} omp_in)"
-    ]
-    return prefix
-
-
 def parallel_num_threads():
     threads = config.cpp.threads
     if threads < 1:
@@ -184,8 +178,84 @@ class CppPrinter(ExprPrinter):
         div = self.paren(self.doprint(div))
         return f"({x} / {div})"
 
+    def _print_Pow(self, expr):
+        # Uses float constants to perform FP div
+        base, exp = expr.args
+        base = self._print(base)
+        assert exp.is_integer
+        exp = int(exp)
+        if exp > 0:
+            return "*".join([self.paren(base)] * exp)
+        elif exp < 0:
+            return "1.0/" + self.paren("*".join([self.paren(base)] * abs(exp)))
+        else:  # exp == 0
+            return "1"
+
+    def _print_Rational(self, expr):
+        # Uses float constants to perform FP div
+        if expr.q == 1:
+            return f"{expr.p}"
+        return f"{expr.p}.0/{expr.q}.0"
+
 
 cexpr = CppPrinter().doprint
+
+
+@dataclasses.dataclass
+class OptimizationContext:
+    key: ClassVar[str] = "opt_ctx"
+
+    # Masked load
+    is_masked_load: bool = False
+    # Load value as mask
+    is_load_as_mask: bool = False
+    # Load bfloat16 value as float32
+    is_load_bf16_as_fp32: bool = False
+    # Store float32 value as bfloat16
+    is_store_fp32_as_bf16: bool = False
+
+    dtype: torch.dtype = torch.float
+    ops_name: str = ""
+    is_most_inner_loop_irrevelant: bool = False
+
+
+class RecordOptimizationContext:
+    def __init__(self, func_name: str = ""):
+        self.func_name = func_name
+        self.current_node: torch.fx.Node = None
+        self.opt_ctx: OptimizationContext = None
+
+    def __enter__(self):
+        assert V.interpreter
+        assert V.interpreter.current_node
+
+        self.current_node: torch.fx.Node = V.interpreter.current_node
+        if OptimizationContext.key in self.current_node.meta:
+            self.opt_ctx = self.current_node.meta[OptimizationContext.key]
+        else:
+            self.opt_ctx = OptimizationContext()
+        self.opt_ctx.ops_name = self.func_name
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        assert self.current_node
+        assert self.opt_ctx
+        self.current_node.meta[OptimizationContext.key] = self.opt_ctx
+
+    def get_opt_ctx(self):
+        return self.opt_ctx
+
+    def get_fx_node(self):
+        assert self.current_node
+        return self.current_node
+
+
+def get_current_node_opt_ctx() -> OptimizationContext:
+    assert V.interpreter.current_node
+    if OptimizationContext.key in V.interpreter.current_node.meta:
+        return V.interpreter.current_node.meta[OptimizationContext.key]
+    else:
+        return None
 
 
 class CppVecOverrides(OpOverrides):
@@ -243,27 +313,31 @@ class CppVecOverrides(OpOverrides):
 
     @staticmethod
     def eq(x, y):
-        return f"{x} == {y}"
+        return f"to_float_mask({x} == {y})"
 
     @staticmethod
     def ne(x, y):
-        return f"{x} != {y}"
+        return f"to_float_mask({x} != {y})"
 
     @staticmethod
     def lt(x, y):
-        return f"{x} < {y}"
+        return f"to_float_mask({x} < {y})"
 
     @staticmethod
     def gt(x, y):
-        return f"{x} > {y}"
+        return f"to_float_mask({x} > {y})"
 
     @staticmethod
     def le(x, y):
-        return f"{x} <= {y}"
+        return f"to_float_mask({x} <= {y})"
 
     @staticmethod
     def ge(x, y):
-        return f"{x} >= {y}"
+        return f"to_float_mask({x} >= {y})"
+
+    @staticmethod
+    def and_(x, y):
+        return f"{x} & {y}"
 
     @staticmethod
     def rsqrt(x):
@@ -303,11 +377,11 @@ class CppVecOverrides(OpOverrides):
 
     @staticmethod
     def logical_and(a, b):
-        return f"{a} && {b}"
+        return f"({a} != 0) & ({b} != 0)"
 
     @staticmethod
     def logical_or(a, b):
-        return f"{a} || {b}"
+        return f"({a} != 0) | ({b} != 0)"
 
     @staticmethod
     def tan(a):
@@ -325,18 +399,90 @@ class CppVecOverrides(OpOverrides):
         return f"{a}.reciprocal()"
 
     @staticmethod
+    def atan(x):
+        return f"{x}.atan()"
+
+    @staticmethod
+    def acos(x):
+        return f"{x}.acos()"
+
+    @staticmethod
+    def asin(x):
+        return f"{x}.asin()"
+
+    @staticmethod
+    def cosh(x):
+        return f"{x}.cosh()"
+
+    @staticmethod
+    def sinh(x):
+        return f"{x}.sinh()"
+
+    @staticmethod
+    def log10(x):
+        return f"{x}.log10()"
+
+    @staticmethod
+    def erfc(x):
+        return f"{x}.erfc()"
+
+    @staticmethod
+    def nextafter(x):
+        return f"{x}.nextafter()"
+
+    @staticmethod
+    def copysign(a, b):
+        return f"{a}.copysign({b})"
+
+    @staticmethod
+    def atan2(a, b):
+        return f"{a}.atan2({b})"
+
+    @staticmethod
+    def hypot(a, b):
+        return f"{a}.hypot({b})"
+
+    @staticmethod
+    def atanh(x):
+        # For real x, atanh(x) = 1/2 * log((1+x)/(1-x))
+        vec_one = f"decltype({x})(1)"
+        vec_one_half = f"decltype({x})(0.5)"
+        return f"{vec_one_half} * (({vec_one} + {x})/({vec_one} - {x})).log()"
+
+    @staticmethod
+    def asinh(x):
+        # For real x, asinh(x) = log(x + sqrt(1 + x**2))
+        vec_one = f"decltype({x})(1)"
+        return f"({x} + ({vec_one} + {x}*{x}).sqrt()).log()"
+
+    @staticmethod
+    def acosh(x):
+        # For real x, acosh(x) = log(x + sqrt(x**2 -1))
+        vec_one = f"decltype({x})(1)"
+        return f"({x} + ({x}*{x} - {vec_one}).sqrt()).log()"
+
+    @staticmethod
     def constant(val, dtype):
+        opt_ctx: OptimizationContext = get_current_node_opt_ctx()
+        assert opt_ctx
+        assert opt_ctx.dtype in [torch.int32, torch.float32]
+        if dtype in [torch.bfloat16]:
+            assert opt_ctx.is_load_bf16_as_fp32
+        proposed_dtype = opt_ctx.dtype
         if val == float("inf"):
-            quote = f"std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::infinity()"
+            assert proposed_dtype == torch.float
+            quote = f"std::numeric_limits<{DTYPE_TO_CPP[proposed_dtype]}>::infinity()"
         elif val == float("-inf"):
-            quote = f"-std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::infinity()"
+            assert proposed_dtype == torch.float
+            quote = f"-std::numeric_limits<{DTYPE_TO_CPP[proposed_dtype]}>::infinity()"
         elif math.isnan(val):
-            quote = f"std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::quiet_NaN()"
+            quote = f"std::numeric_limits<{DTYPE_TO_CPP[proposed_dtype]}>::quiet_NaN()"
         elif val is True or val is False:
-            quote = f"static_cast<{DTYPE_TO_CPP[dtype]}>({str(val).lower()})"
+            quote = f"static_cast<{DTYPE_TO_CPP[proposed_dtype]}>({str(val).lower()})"
         else:
-            quote = f"static_cast<{DTYPE_TO_CPP[dtype]}>({repr(val)})"
-        return f"at::vec::Vectorized<{DTYPE_TO_CPP[dtype]}>({quote})"
+            quote = f"static_cast<{DTYPE_TO_CPP[proposed_dtype]}>({repr(val)})"
+
+        return f"at::vec::Vectorized<{DTYPE_TO_CPP[proposed_dtype]}>({quote})"
 
     @staticmethod
     def relu(x):
@@ -373,7 +519,7 @@ class CppVecOverrides(OpOverrides):
 
     @staticmethod
     def square(a):
-        return f"{a}.pow(2)"
+        return f"{a} * {a}"
 
     @staticmethod
     def where(a, b, c):
@@ -400,12 +546,55 @@ class CppVecOverrides(OpOverrides):
 
     @staticmethod
     def to_dtype(x, dtype):
-        assert dtype in [torch.bool], f"{__name__} does not support {dtype}"
+        assert dtype in [
+            torch.bool,
+            torch.float,
+            torch.bfloat16,
+        ], f"{__name__} does not support {dtype}"
         return f"({x})"
 
     @staticmethod
     def log1p(x):
         return f"{x}.log1p()"
+
+    @staticmethod
+    def masked(mask, body, other):
+        opt_ctx: OptimizationContext = get_current_node_opt_ctx()
+        assert opt_ctx
+        assert opt_ctx.is_masked_load
+
+        code = BracesBuffer()
+        var = V.kernel.cse.newvar()
+        code.writeline(f"auto {var} = [&]")
+        with V.kernel.swap_buffers(code), code.indent():
+            result = body()
+            code.writeline(f"return {result};")
+        code.writeline(";")
+        V.kernel.compute.splice(code)
+
+        if other == float("-inf"):
+            other_code = (
+                "at::vec::Vectorized<float>(-std::numeric_limits<float>::infinity())"
+            )
+        elif other == float("inf"):
+            other_code = (
+                "at::vec::Vectorized<float>(std::numeric_limits<float>::infinity())"
+            )
+        else:
+            other_code = f"at::vec::Vectorized<float>({other!r})"
+
+        type = f"decltype({var}())"
+        float_mask = f"to_float_mask({mask})"
+        return f"{type}::blendv({other_code}, {var}(), {float_mask})"
+
+    @staticmethod
+    def index_expr(expr, dtype):
+        assert dtype == torch.int64
+        opt_ctx: OptimizationContext = get_current_node_opt_ctx()
+        assert opt_ctx
+        assert opt_ctx.dtype == torch.int32
+        assert opt_ctx.is_most_inner_loop_irrevelant
+        return f"at::vec::Vectorized<int>(static_cast<int>({cexpr(V.kernel.rename_indexing(expr))}))"
 
 
 class CppOverrides(OpOverrides):
@@ -427,6 +616,10 @@ class CppOverrides(OpOverrides):
     @staticmethod
     def cos(x):
         return f"std::cos({x})"
+
+    @staticmethod
+    def neg(x):
+        return f"decltype({x})(-{x})"
 
     @staticmethod
     def exp(x):
@@ -522,6 +715,62 @@ class CppOverrides(OpOverrides):
         return f"std::lgamma({x})"
 
     @staticmethod
+    def acos(x):
+        return f"std::acos({x})"
+
+    @staticmethod
+    def acosh(x):
+        return f"std::acosh({x})"
+
+    @staticmethod
+    def cosh(x):
+        return f"std::cosh({x})"
+
+    @staticmethod
+    def sinh(x):
+        return f"std::sinh({x})"
+
+    @staticmethod
+    def asin(x):
+        return f"std::asin({x})"
+
+    @staticmethod
+    def asinh(x):
+        return f"std::asinh({x})"
+
+    @staticmethod
+    def atan2(x, y):
+        return f"std::atan2({x}, {y})"
+
+    @staticmethod
+    def atan(x):
+        return f"std::atan({x})"
+
+    @staticmethod
+    def atanh(x):
+        return f"std::atanh({x})"
+
+    @staticmethod
+    def copysign(x, y):
+        return f"std::copysign({x}, {y})"
+
+    @staticmethod
+    def hypot(x, y):
+        return f"std::hypot({x}, {y})"
+
+    @staticmethod
+    def erfc(x):
+        return f"std::erfc({x})"
+
+    @staticmethod
+    def log10(x):
+        return f"std::log10({x})"
+
+    @staticmethod
+    def nextafter(x, y):
+        return f"std::nextafter({x}, {y})"
+
+    @staticmethod
     def relu(x):
         return f"{x} * ({x}>0)"
 
@@ -581,7 +830,7 @@ class CppOverrides(OpOverrides):
         if other == float("-inf"):
             other_code = f"-std::numeric_limits<{type}>::infinity()"
         elif other == float("inf"):
-            other_code = "std::numeric_limits<{type}>::infinity()"
+            other_code = f"std::numeric_limits<{type}>::infinity()"
         elif isinstance(other, bool):
             other_code = f"static_cast<{type}>({str(other).lower()})"
         else:
@@ -607,8 +856,7 @@ class CppOverrides(OpOverrides):
 
     @staticmethod
     def sigmoid(x):
-        x = ops.exp(f"-{x}")
-        return f"1 / (1 + {x})"
+        return f"decltype({x})(1) / (decltype({x})(1) + std::exp(-{x}))"
 
     @staticmethod
     def sign(x):
@@ -631,7 +879,7 @@ class CppKernel(Kernel):
     suffix = ";"
 
     def __init__(self, args, num_threads):
-        super(CppKernel, self).__init__(args)
+        super().__init__(args)
         self.call_ranges = None
         self.ranges = None
         self.itervars = None
@@ -656,7 +904,7 @@ class CppKernel(Kernel):
         var = self.args.input(name)
         index = self.rename_indexing(index)
         line = f"{var}[{cexpr(index)}]"
-        if V.graph.get_dtype(name) in (torch.float16, torch.bfloat16):
+        if V.graph.get_dtype(name) in [torch.float16]:
             line = f"static_cast<float>({line})"
         return self.cse.generate(self.loads, line)
 
@@ -696,13 +944,14 @@ class CppKernel(Kernel):
                 ],
             )
         else:
-            if dtype == torch.float16:
-                self.reduction_prefix.writelines(
-                    float16_reduction_prefix(reduction_type)
+            if dtype in (torch.float16, torch.bfloat16):
+                self.reduction_prefix.writeline(
+                    f"float {tmpvar} = {reduction_init(reduction_type, dtype)};"
                 )
-            self.reduction_prefix.writeline(
-                f"{DTYPE_TO_CPP[dtype]} {tmpvar} = {reduction_init(reduction_type, dtype)};"
-            )
+            else:
+                self.reduction_prefix.writeline(
+                    f"{DTYPE_TO_CPP[dtype]} {tmpvar} = {reduction_init(reduction_type, dtype)};"
+                )
             self.stores.writeline(
                 None, f"{reduction_combine(reduction_type, tmpvar, value)};"
             )
@@ -853,7 +1102,7 @@ class CppVecKernel(CppKernel):
     overrides = CppVecOverrides
 
     def __init__(self, args, num_threads, tiling_factor=0):
-        super(CppVecKernel, self).__init__(args, num_threads)
+        super().__init__(args, num_threads)
         assert codecache.pick_vec_isa()
         if tiling_factor == 0:
             tiling_factor = codecache.pick_vec_isa().nelements()
@@ -881,22 +1130,29 @@ class CppVecKernel(CppKernel):
         expanded_index = sympy.expand(index)
         new_index = self.scale_index_with_offset(index, self.tiling_factor)
 
-        if expanded_index == new_index:
-            line = f"at::vec::Vectorized<float>({var}[{cexpr(index)}])"
-        else:
-            if V.graph.get_dtype(name) in [torch.bool, torch.uint8]:
-                nelements = codecache.pick_vec_isa().nelements()
-                if var not in self.var_vec_buf_map:
-                    self.var_vec_buf_map[var] = f"g_tmp_buffer_{var}"
-                    self.loads.writeline(
-                        f"float {self.var_vec_buf_map[var]}[{nelements}] = {{0}};"
-                    )
+        is_broadcast = expanded_index == new_index
+
+        var_expr = (
+            f"{var}[{cexpr(index)}]" if is_broadcast else f"{var} + {cexpr(new_index)}"
+        )
+
+        if V.graph.get_dtype(name) in [torch.bool, torch.uint8]:
+            nelements = codecache.pick_vec_isa().nelements()
+            if var not in self.var_vec_buf_map:
+                self.var_vec_buf_map[var] = f"g_tmp_buffer_{var}"
                 self.loads.writeline(
-                    f"flag_to_float({var} + {cexpr(new_index)}, {self.var_vec_buf_map[var]}, {nelements});"
+                    f"float {self.var_vec_buf_map[var]}[{nelements}] = {{0}};"
                 )
-                line = f"at::vec::Vectorized<float>::loadu({self.var_vec_buf_map[var]})"
-            else:
-                line = f"at::vec::Vectorized<float>::loadu({var} + {cexpr(new_index)})"
+            self.loads.writeline(
+                f"flag_to_float({var_expr}, {self.var_vec_buf_map[var]}, {nelements});"
+            )
+            line = f"at::vec::Vectorized<float>::loadu({self.var_vec_buf_map[var]})"
+        elif V.graph.get_dtype(name) in [torch.bfloat16]:
+            line = f"load_bf16_as_float({var_expr})"
+        elif is_broadcast:
+            line = f"at::vec::Vectorized<float>({var_expr})"
+        else:
+            line = f"at::vec::Vectorized<float>::loadu({var_expr})"
 
         return self.cse.generate(self.loads, line)
 
@@ -909,7 +1165,10 @@ class CppVecKernel(CppKernel):
         expanded_index = sympy.expand(index)
         new_index = self.scale_index_with_offset(index, self.tiling_factor)
         assert new_index != expanded_index
-        line = f"{value}.store({var} + {cexpr(new_index)});"
+        if V.graph.get_dtype(name) in [torch.bfloat16]:
+            line = f"store_float_as_bf16({var} + {cexpr(new_index)}, {value});"
+        else:
+            line = f"{value}.store({var} + {cexpr(new_index)});"
         self.stores.writeline(name, line)
 
     def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
@@ -1153,14 +1412,14 @@ class CppTile2DTailKernel(CppKernel):
 
 class CppVecKernelChecker(CppVecKernel):
     def __init__(self, args, num_threads, tiling_factor):
-        super(CppVecKernelChecker, self).__init__(args, num_threads, tiling_factor)
+        super().__init__(args, num_threads, tiling_factor)
 
-        # Since this kernel is only for checker but does not genreate any
+        # Since this kernel is only for checker but does not generate any
         # code, so we need to decrease the kernel count.
         metrics.generated_kernel_count -= 1
         metrics.generated_cpp_vec_kernel_count -= 1
 
-        # Used to recorde the graph wrapper code as the wrapper_code status could be
+        # Used to record the graph wrapper code as the wrapper_code status could be
         # changed during graph run.
         self._orig_wrapper_code = None
 
@@ -1171,10 +1430,35 @@ class CppVecKernelChecker(CppVecKernel):
                 self.fast_vec_list.append(k)
         self.exit_stack = contextlib.ExitStack()
 
+        # Cache all the load result
+        self.load_results: list[CSEVariable] = []
+        self.load_supported_dtypes: list[torch.dtype] = [
+            torch.float,
+            torch.bfloat16,
+            torch.bool,
+            torch.uint8,
+        ]
+        self.store_supported_dtypes: list[torch.dtype] = [torch.float, torch.bfloat16]
+        # Cache the dtypes of the store operation. If the store is mixing dtypes, the
+        # vectorization would not support it as it is hard to determine the vec dtype
+        self.store_dtypes: list[torch.dtype] = []
+        # The dtype is used for vectorization
+        self.vec_dtype: torch.dtype = torch.float32
+
+    def is_indirect_indexing(self, index: sympy.Expr):
+        for _load_res in self.load_results:
+            # The index expression contains a value that loads from memory
+            if index.count(sympy_symbol(_load_res.name)) > 0:
+                return True
+        return False
+
     def could_vec(self, name: str, index: sympy.Expr):
         assert self.itervars is not None
         # Not a loop
         if len(self.itervars) == 0:
+            return False
+
+        if self.is_indirect_indexing(index):
             return False
 
         most_inner_var = self.itervars[-1]
@@ -1182,34 +1466,123 @@ class CppVecKernelChecker(CppVecKernel):
             most_inner_var, index
         )
 
-    def load(self, name: str, index: sympy.Expr):
-        if not V.graph.get_dtype(name) in [
-            torch.float,
-            torch.float32,
-            torch.bool,
-            torch.uint8,
-        ]:
-            self.simd_vec = False
-            return self.simd_vec
+    def is_mask(self, name: str, users: Dict[torch.fx.Node, None]):
+        load_type = V.graph.get_dtype(name)
+        if load_type == torch.bool:
+            return all(user.target in ("where", "masked") for user in users.keys())
+        elif load_type == torch.uint8:
+            """
+            If the load value is torch.uint8, then we only support the loaded
+            value is as the mask.
+            """
+            if not all(
+                user.target == "to_dtype" and user.args[-1] == torch.bool
+                for user in users.keys()
+            ):
+                return False
 
-        index = self.rename_indexing(index)
-        self.simd_vec = self.simd_vec and self.could_vec(name, index)
-        return self.simd_vec
-
-    def store(self, name, index, value, mode=None):
-        if not V.graph.get_dtype(name) in [torch.float, torch.float32]:
-            self.simd_vec = False
-            return self.simd_vec
-
-        assert "buf" in name
-        index = self.rename_indexing(index)
-
-        if mode:
-            self.simd_vec = False
+            for to_dtype_node in users.keys():
+                assert to_dtype_node.target == "to_dtype"
+                if not all(
+                    user.target in ("where", "masked")
+                    for user in to_dtype_node.users.keys()
+                ):
+                    return False
+            return True
+        else:
             return False
 
-        self.simd_vec = self.simd_vec and self.could_vec(name, index)
-        return self.simd_vec
+    def can_load_bf16_as_fp32(self, input_node: torch.fx.Node):
+        assert input_node.target in ["load", "constant"]
+        load_type = (
+            V.graph.get_dtype(input_node.args[1])
+            if input_node.target == "load"
+            else input_node.args[-1]
+        )
+        if load_type not in [torch.bfloat16]:
+            return False
+
+        if not all(
+            user.target == "to_dtype" and user.args[-1] == torch.float
+            for user in input_node.users
+        ):
+            return False
+
+        return True
+
+    def can_store_fp32_as_bf16(self, store_var: str, value_node: torch.fx.Node):
+        load_type = V.graph.get_dtype(store_var)
+        if load_type not in [torch.bfloat16]:
+            return False
+
+        if value_node.target == "to_dtype" and value_node.args[-1] == torch.bfloat16:
+            return True
+
+        return False
+
+    def load(self, name: str, index: sympy.Expr):
+        with RecordOptimizationContext(__name__) as node_ctx:
+            load_dtype = V.graph.get_dtype(name)
+            opt_ctx: OptimizationContext = node_ctx.get_opt_ctx()
+            assert opt_ctx
+            opt_ctx.dtype = load_dtype
+            opt_ctx.is_load_as_mask = self.is_mask(name, node_ctx.get_fx_node().users)
+
+            var = self.cse.newvar()
+            self.load_results.append(var)
+
+            if load_dtype in [torch.bool, torch.uint8] and not opt_ctx.is_load_as_mask:
+                self.simd_vec = False
+                return var
+
+            if load_dtype not in self.load_supported_dtypes:
+                self.simd_vec = False
+                return var
+
+            if load_dtype in [torch.bfloat16]:
+                opt_ctx.is_load_bf16_as_fp32 = self.can_load_bf16_as_fp32(
+                    node_ctx.get_fx_node()
+                )
+                if not opt_ctx.is_load_bf16_as_fp32:
+                    self.simd_vec = False
+                    return var
+
+            index = self.rename_indexing(index)
+            self.simd_vec = self.simd_vec and self.could_vec(name, index)
+            return var
+
+    def store(self, name, index, value, mode=None):
+        with RecordOptimizationContext(__name__) as node_ctx:
+            store_dtype = V.graph.get_dtype(name)
+
+            opt_ctx: OptimizationContext = node_ctx.get_opt_ctx()
+            assert opt_ctx
+            opt_ctx.dtype = store_dtype
+
+            store_dtype = torch.float if store_dtype == torch.float32 else store_dtype
+            self.store_dtypes.append(store_dtype)
+            if store_dtype not in self.store_supported_dtypes:
+                self.simd_vec = False
+                return self.simd_vec
+
+            if store_dtype in [torch.bfloat16]:
+                value_node = node_ctx.get_fx_node().all_input_nodes[-1]
+                opt_ctx.is_store_fp32_as_bf16 = self.can_store_fp32_as_bf16(
+                    name, value_node
+                )
+                if not opt_ctx.is_store_fp32_as_bf16:
+                    self.simd_vec = False
+                    return self.simd_vec
+
+            assert "buf" in name
+            index = self.rename_indexing(index)
+
+            if mode:
+                self.simd_vec = False
+                return self.simd_vec
+
+            self.simd_vec = self.simd_vec and self.could_vec(name, index)
+            return self.simd_vec
 
     def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
         if (
@@ -1222,6 +1595,92 @@ class CppVecKernelChecker(CppVecKernel):
             self.simd_vec = False
         return self.simd_vec
 
+    def is_supported_cmp(self, node: torch.fx.Node):
+        def get_node_dtype(node):
+            if type(node) == torch.fx.Node:
+                opt_ctx: OptimizationContext = get_current_node_opt_ctx()
+                return opt_ctx.dtype if opt_ctx else None
+            else:
+                return None
+
+        def get_cmp_dtypes(node: torch.fx.Node):
+            return get_node_dtype(node.args[-2]), get_node_dtype(node.args[-1])
+
+        assert len(node.args) >= 2
+        # cmp(x, y): y is a magic value like x >= 1
+        if type(node.args[-1]) in [int, float]:
+            return True
+        # cmp(x, y): x is a magic value like 1 >= y
+        if type(node.args[-2]) in [int, float]:
+            return False
+
+        left_dtype, right_dtype = get_cmp_dtypes(node)
+        if left_dtype is None or right_dtype is None:
+            # TODO(Eikan): To record, deduce and propagate the data type of every expression.
+            return True
+        else:
+            return left_dtype == right_dtype
+
+    def is_load_only_block(self, sub_graph: torch.fx.Graph):
+        # The sub graph only contains "placeholder", "output", "get_index", "load", "to_dtype"
+        is_load_only = False
+        load_dtype = None
+        skip_io_nodes = ["placeholder", "output"]
+        for _node in sub_graph.nodes:
+            if _node.op in skip_io_nodes:
+                continue
+
+            if _node.target not in ["load", "get_index", "constant", "to_dtype"]:
+                # The body contains non load node
+                is_load_only = False
+                break
+
+            if _node.target in ["load", "constant"]:
+                load_dtype = (
+                    V.graph.get_dtype(_node.args[1])
+                    if _node.target == "load"
+                    else _node.args[-1]
+                )
+                is_bf16_as_fp32 = load_dtype in [
+                    torch.bfloat16
+                ] and self.can_load_bf16_as_fp32(_node)
+                is_fp32 = load_dtype in [torch.float]
+                is_load_only = is_bf16_as_fp32 or is_fp32
+                load_dtype = torch.float if is_load_only else load_dtype
+                if not is_load_only:
+                    break
+
+                # Create and record the context
+                opt_ctx = OptimizationContext()
+                opt_ctx.dtype = load_dtype
+                opt_ctx.ops_name = _node.target
+                opt_ctx.is_load_bf16_as_fp32 = True if is_bf16_as_fp32 else False
+                _node.meta[OptimizationContext.key] = opt_ctx
+
+            if _node.target == "to_dtype":
+                dtype = _node.args[-1]
+                if dtype == torch.float:
+                    # load -> to_dtype
+                    is_load_only = all(
+                        usr.target in ["ops", "load", "constant"]
+                        for usr in _node.all_input_nodes
+                    )
+                elif dtype == torch.bfloat16:
+                    # to_dtype -> store
+                    is_load_only = all(usr.target in ["store"] for usr in _node.users)
+                else:
+                    is_load_only = False
+
+                if not is_load_only:
+                    break
+
+            if _node.target == "get_index":
+                is_load_only = all(usr.target in ["load"] for usr in _node.users)
+                if not is_load_only:
+                    break
+
+        return is_load_only, load_dtype
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         assert self._orig_wrapper_code is not None
         # Restore the wrapper_code
@@ -1229,19 +1688,31 @@ class CppVecKernelChecker(CppVecKernel):
         self.exit_stack.__exit__(exc_type, exc_val, exc_tb)
 
     def __enter__(self):
-        # Recorde the graph wrapper code. The wrapper_code status could be
+        # Record the graph wrapper code. The wrapper_code status could be
         # changed during graph run. Regarding this checker, we also need to
         # run the graph but we don't expect to change any status that would
-        # impact the code generation. Hence, we record the graph wapper code
-        # and replace it with a dummy warpper_code and then restore to the
+        # impact the code generation. Hence, we record the graph wrapper code
+        # and replace it with a dummy wrapper_code and then restore to the
         # original one as long as the checker is finished.
         self._orig_wrapper_code = V.graph.wrapper_code
         V.graph.wrapper_code = WrapperCodeGen()
 
         class VecCheckerProxy:
             @staticmethod
+            def _bin_cmp_op(x, y):
+                current_node: torch.fx.Node = V.interpreter.current_node
+                if not self.is_supported_cmp(current_node):
+                    self.simd_vec = False
+                return self.simd_vec
+
+            @staticmethod
             def __getattr__(name):
+                bin_cmp_ops = ["eq", "ne", "le", "ge", "lt", "gt"]
+
                 def inner(*args, **kwargs):
+                    if name in bin_cmp_ops:
+                        return VecCheckerProxy._bin_cmp_op(args, kwargs)
+
                     if not (name in self.fast_vec_list):
                         self.simd_vec = False
                     return self.simd_vec
@@ -1264,17 +1735,107 @@ class CppVecKernelChecker(CppVecKernel):
 
             @staticmethod
             def constant(val, dtype):
-                supported_dtype = (torch.float32, torch.int32)
-                is_supported_dtype = dtype in (supported_dtype)
-                if not is_supported_dtype:
-                    self.simd_vec = False
-                return is_supported_dtype
+                with RecordOptimizationContext(__name__) as node_ctx:
+                    opt_ctx: OptimizationContext = node_ctx.get_opt_ctx()
+                    assert opt_ctx
+                    opt_ctx.dtype = dtype
+                    i32_iinfo = numpy.iinfo(numpy.int32)
+                    if (
+                        dtype == torch.int64
+                        and val <= i32_iinfo.max
+                        and val >= i32_iinfo.min
+                    ):
+                        opt_ctx.dtype = torch.int32
+
+                    f32_iinfo = numpy.finfo(numpy.float32)
+                    if dtype == torch.double:
+                        if (
+                            (val <= f32_iinfo.max and val >= f32_iinfo.min)
+                            or (val == numpy.inf)
+                            or (val == -numpy.inf)
+                        ):
+                            opt_ctx.dtype = torch.float32
+
+                    supported_dtypes = [torch.float32, torch.int32, torch.bfloat16]
+                    if opt_ctx.dtype not in supported_dtypes:
+                        self.simd_vec = False
+
+                    if opt_ctx.dtype in [torch.bfloat16]:
+                        if self.can_load_bf16_as_fp32(node_ctx.get_fx_node()):
+                            opt_ctx.is_load_bf16_as_fp32 = True
+                            opt_ctx.dtype = torch.float
+                        else:
+                            self.simd_vec = False
+
+                    return val
 
             @staticmethod
             def index_expr(expr, dtype):
-                self.simd_vec = False
-                tmp_var = self.cse.newvar()
-                return tmp_var
+                current_node: torch.fx.Node = V.interpreter.current_node
+
+                assert len(self.ranges) == len(self.itervars)
+                if not len(self.ranges) or not all(
+                    not isinstance(range, sympy.Expr) or sympy.simplify(range).is_number
+                    for range in self.ranges
+                ):
+                    # if the range value is sympy.Expr, we might could not deduce the accurate loop interval.
+                    self.simd_vec = False
+                    return self.cse.newvar()
+
+                def mod_indexing_rep(x, y, z):
+                    if z.is_constant():
+                        return x / y
+
+                    # never really happens, we'll bail on optimizing
+                    return (x / y) % z
+
+                def indexing_div_rep(x, y):
+                    return x / y
+
+                with RecordOptimizationContext(__name__) as node_ctx:
+                    assert len(self.ranges) == len(self.itervars)
+
+                    opt_ctx: OptimizationContext = node_ctx.get_opt_ctx()
+                    assert opt_ctx
+                    max_expr = expr.replace(
+                        ir.ModularIndexing, mod_indexing_rep
+                    ).replace(ir.FloorDiv, indexing_div_rep)
+                    min_expr = max_expr
+                    for idx in range(len(self.ranges)):
+                        max_expr = sympy.maximum(
+                            max_expr,
+                            self.itervars[idx],
+                            sympy.Interval(0, self.ranges[idx]),
+                        )
+                        min_expr = sympy.minimum(
+                            min_expr,
+                            self.itervars[idx],
+                            sympy.Interval(0, self.ranges[idx]),
+                        )
+                    i32_iinfo = numpy.iinfo(numpy.int32)
+                    if (
+                        dtype == torch.int64
+                        and max_expr.is_number
+                        and min_expr.is_number
+                        and max_expr <= i32_iinfo.max
+                        and min_expr >= i32_iinfo.min
+                    ):
+                        opt_ctx.dtype = torch.int32
+                    else:
+                        opt_ctx.dtype = dtype
+                        self.simd_vec = False
+
+                    # Pick the most inner loop variable since we always vectorize the
+                    # most inner loop
+                    most_inner_var = self.itervars[-1]
+                    most_inner_loop_irrevelant = self.is_invariant_under(
+                        most_inner_var, expr
+                    )
+                    if not most_inner_loop_irrevelant:
+                        self.simd_vec = False
+                    opt_ctx.is_most_inner_loop_irrevelant = most_inner_loop_irrevelant
+                    tmp_var = self.cse.newvar()
+                    return tmp_var
 
             @staticmethod
             def indirect_indexing(index_var):
@@ -1283,14 +1844,69 @@ class CppVecKernelChecker(CppVecKernel):
 
             @staticmethod
             def masked(mask, body, other):
-                tmp_var = self.cse.newvar()
-                return tmp_var
+                with RecordOptimizationContext(__name__) as node_ctx:
+                    opt_ctx: OptimizationContext = node_ctx.get_opt_ctx()
+                    assert opt_ctx
+                    is_masked_load, load_dtype = self.is_load_only_block(body.graph)
+                    opt_ctx.dtype = load_dtype
+                    opt_ctx.is_masked_load = is_masked_load
+
+                    _simd_vec = is_masked_load and load_dtype in [
+                        torch.float32,
+                        torch.float,
+                    ]
+                    if not _simd_vec:
+                        self.simd_vec = False
+
+                    tmp_var = self.cse.newvar()
+                    return tmp_var
 
             @staticmethod
             def to_dtype(x, dtype):
-                if dtype != torch.bool:
-                    self.simd_vec = False
-                return x
+                with RecordOptimizationContext(__name__) as node_ctx:
+                    opt_ctx: OptimizationContext = node_ctx.get_opt_ctx()
+                    assert opt_ctx
+                    opt_ctx.dtype = dtype
+
+                    cur_node = node_ctx.get_fx_node()
+                    input_value: torch.fx.Node = cur_node.all_input_nodes[1]
+                    if dtype == torch.float and input_value.target in [
+                        "load",
+                        "constant",
+                    ]:
+                        # Support masked_load for BF16. Because the legalization will
+                        # insert to_dtype to convert the BF16 input to FP32.
+                        dtype = (
+                            V.graph.get_dtype(input_value.args[1])
+                            if input_value.target == "load"
+                            else input_value.args[-1]
+                        )
+                        if dtype in [torch.bfloat16]:
+                            opt_ctx.is_load_bf16_as_fp32 = True
+                        else:
+                            self.simd_vec = False
+                    elif dtype == torch.float and input_value.target in ["where"]:
+                        # Support masked_fill_softmax
+                        pass
+                    elif dtype == torch.bfloat16:
+                        if not all(usr.target == "store" for usr in cur_node.users):
+                            self.simd_vec = False
+                            return x
+
+                        store_names = [usr.args[1] for usr in cur_node.users]
+                        if not all(
+                            V.graph.get_dtype(name) in [torch.bfloat16]
+                            for name in store_names
+                        ):
+                            self.simd_vec = False
+                            return x
+
+                        opt_ctx.is_store_fp32_as_bf16 = True
+                    elif dtype == torch.bool:
+                        pass
+                    else:
+                        self.simd_vec = False
+                    return x
 
         self.exit_stack.enter_context(V.set_ops_handler(VecCheckerProxy()))
         self.exit_stack.enter_context(V.set_kernel_handler(self))
@@ -1314,6 +1930,13 @@ class CppTile2DKernelChecker(CppVecKernelChecker):
     def check_can_tile2d(self, name: str, index: sympy.Expr):
         if not self.can_tile2d:
             return
+        # make sure the transpose_mxn(src, ld_src, dst, ld_dst) ld_src doesn't depend on most inner var.
+        if len(self.itervars) > 0 and not self.is_invariant_under(
+            self.itervars[-1], self.stride_at(self.itervars[-1], index)
+        ):
+            self.can_tile2d = False
+            return
+
         # check contiguity from any of the outer loops
         has_stride1 = False
         for loop_idx, itervar in enumerate(self.itervars[:-1]):
@@ -1327,6 +1950,7 @@ class CppTile2DKernelChecker(CppVecKernelChecker):
                 else:
                     self.outer_tiling_idx = loop_idx
                 has_stride1 = True
+
         if not has_stride1 and not self.could_vec(name, index):
             self.can_tile2d = False
         return self.can_tile2d
@@ -1365,15 +1989,102 @@ class CppTile2DKernelChecker(CppVecKernelChecker):
 
 class CppKernelProxy(CppKernel):
     def __init__(self, kernel_group):
-        super(CppKernelProxy, self).__init__(
-            kernel_group.args, kernel_group.ws.num_threads
-        )
+        super().__init__(kernel_group.args, kernel_group.ws.num_threads)
         self.kernel_group = kernel_group
         self.loop_nest = None
         self.call_ranges = None
         self.picked_vec_isa: codecache.VecISA = codecache.pick_vec_isa()
 
+    def legalize_bf16(self, nodes):
+        def add_to_dtype(sub_graph: torch.fx.Graph):
+            for node in sub_graph.nodes:
+                _node: torch.fx.Node = node
+                if _node.target in ["load", "constant"]:
+                    assert len(_node.args) == 3
+                    ops = _node.args[0]
+                    # If the node is constant, the last arg is dtype
+                    load_dtype = (
+                        V.graph.get_dtype(_node.args[1])
+                        if _node.target == "load"
+                        else _node.args[-1]
+                    )
+
+                    if load_dtype == torch.bfloat16:
+                        with sub_graph.inserting_after(_node):
+                            to_type_node = sub_graph.call_method(
+                                "to_dtype", args=(ops, _node, torch.float)
+                            )
+                            to_type_node_args = to_type_node.args
+                            _node.replace_all_uses_with(to_type_node)
+                            to_type_node.args = to_type_node_args
+                elif _node.target == "store":
+                    ops, store_var, _, value_var, _ = _node.args
+                    store_dtype = V.graph.get_dtype(store_var)
+                    if store_dtype == torch.bfloat16:
+                        with sub_graph.inserting_before(_node):
+                            to_type_node = sub_graph.call_method(
+                                "to_dtype", args=(ops, value_var, torch.bfloat16)
+                            )
+                            _node.replace_input_with(value_var, to_type_node)
+                elif _node.target == "reduction":
+                    (
+                        ops,
+                        name,
+                        dtype,
+                        src_dtype,
+                        reduction_type,
+                        index,
+                        value,
+                    ) = _node.args
+                    if src_dtype == torch.bfloat16:
+                        # Since we always convert the load/store value to float if the tensor is blfoat16.
+                        # Therefore, the reduction should never work with bfloat16 value. Hence, we update
+                        # the bfloat16 reduction by updating the dtype and src_dtype to float.
+                        assert dtype in [torch.float, torch.bfloat16]
+                        _node.args = (
+                            ops,
+                            name,
+                            torch.float,
+                            torch.float,
+                            reduction_type,
+                            index,
+                            value,
+                        )
+                elif _node.target == "to_dtype" and _node.args[-1] in [torch.bfloat16]:
+                    (ops, x, _) = _node.args
+                    from_load = _node.all_input_nodes[-1].target == "load"
+                    to_store = all(usr.target == "store" for usr in _node.users)
+                    # The legalization always loads the BF16 tensor as FP32 for computation and converts
+                    # back to BF16 after the computation. Hence, there should be no computation w/ BF16.
+                    # Therefore, we update the to_dtype by replacing the bf16 dtype with fp32.
+                    if not (from_load or to_store):
+                        _node.args = (ops, x, torch.float)
+                else:
+                    pass
+
+            def eliminate_to_dtype(sub_graph: torch.fx.Graph):
+                # TODO(Eikan) Remove redundant to_dtype like load_bf16 + to_fp32 + to_bf16 + store_bf16
+                # => load_bf16 + store_bf16
+                pass
+
+            eliminate_to_dtype(sub_graph)
+
+        def _legalize_bf16(loop_body: ir.LoopBody):
+            sub_blocks = [loop_body.root_block] + list(loop_body.subblocks.values())
+            for sub_block in sub_blocks:
+                add_to_dtype(sub_block.graph)
+
+        for _node in nodes:
+            assert isinstance(_node, SchedulerNode)
+            node: SchedulerNode = _node
+            if isinstance(node._body, ir.LoopBody):
+                body: ir.LoopBody = node._body
+                _legalize_bf16(body)
+
     def codegen_nodes(self, nodes):
+        # Legalize BF16 node by adding to_dtype explicitly
+        self.legalize_bf16(nodes)
+
         kernel_group = self.kernel_group
         _, (group, reduction_group) = max(
             nodes, key=lambda x: int(x.is_reduction())
@@ -1425,7 +2136,6 @@ class CppKernelProxy(CppKernel):
         # should not do this again to avoid context conflict. By now, we only control the
         # config.inplace_buffers. In the future, we could maintain more contexts.
         with torch._inductor.config.patch(inplace_buffers=False):
-
             with CppVecKernelChecker(
                 deepcopy(self.kernel_group.args), parallel_num_threads(), tiling_factor
             ) as vec_checker:
@@ -1556,7 +2266,12 @@ class KernelGroup:
         )
         if enable_kernel_profile:
             code.writelines(["#include <ATen/record_function.h>"])
-        code.writelines([cpp_prefix(), "" f'extern "C" void kernel({arg_defs})'])
+        kernel_decl_name = kernel_name if V.graph.aot_mode else "kernel"
+
+        if not V.graph.aot_mode or self.count == 1:
+            code.writeline(cpp_prefix())
+
+        code.writeline(f'extern "C" void {kernel_decl_name}({arg_defs})')
         with code.indent():
             if enable_kernel_profile:
                 graph_id = V.graph.graph_id
@@ -1571,9 +2286,12 @@ class KernelGroup:
             code.splice(self.loops_code)
 
         codecache_def = IndentedBuffer()
-        codecache_def.writeline("async_compile.cpp('''")
-        codecache_def.splice(code)
-        codecache_def.writeline("''')")
+        if V.graph.aot_mode:
+            codecache_def.splice(code)
+        else:
+            codecache_def.writeline("async_compile.cpp('''")
+            codecache_def.splice(code)
+            codecache_def.writeline("''')")
 
         codecache_str = codecache_def.getvalue()
         # TODO(voz): Ostensibly, we should not need this. But there are cases where C++ codegen does

@@ -7,6 +7,7 @@ import weakref
 from typing import Dict, Optional, Set
 
 import torch
+from torch._guards import tracing
 from torch.fx.graph_module import _forward_from_src as original_forward_from_src
 
 from . import config, exc
@@ -287,7 +288,6 @@ def _compile(
     hooks: Hooks,
     frame: Optional[types.FrameType] = None,
 ) -> Optional[GuardedCode]:
-
     output: Optional[OutputGraph] = None
     # This is shared across restarts
     mutated_closure_cell_contents: Set[str] = set()
@@ -308,7 +308,8 @@ def _compile(
             export,
             mutated_closure_cell_contents,
         )
-        tracer.run()
+        with tracing(tracer.output.tracing_context):
+            tracer.run()
         output = tracer.output
         assert output is not None
         assert output.output_instructions
@@ -328,9 +329,9 @@ def _compile(
                 log.debug("Restarting analysis ...")
                 if attempt > 100:
                     unimplemented("100+ RestartAnalysis() calls")
-            except exc.SkipFrame:
+            except exc.SkipFrame as e:
                 log.debug(
-                    f"Skipping frame {code.co_name} \
+                    f"Skipping frame {e} {code.co_name} \
                     {code.co_filename} {code.co_firstlineno}"
                 )
                 if one_graph:
