@@ -44,6 +44,57 @@ class TestControlFlow(TestCase):
         res = control_flow.map(f, xs, y)
 
         self.assertEqual(res, control_flow.map(f, torch.ones(3, 2, 2), torch.ones(2)))
+    
+    def test_map_pytree_input_output(self):
+        def f(x, y):
+            return {'a': (x[0]['a'] + 1) * y, 'b': ((x[1][0]['c'] + 1) * (x[1][1]['d'] + 1) * y, )}
+        x = ({'a': torch.ones(3, 2, 2, requires_grad=True)}, ({'c': torch.ones(3, 1, requires_grad=True)}, {'d': torch.ones(3, 2, requires_grad=True)}))
+        y = torch.ones(1)
+        z = control_flow.map(f, x, y)
+        expected = {'a': torch.ones(3, 2, 2) + 1, 'b':((torch.ones(3, 2) + 1) * 2, )}
+        self.assertEqual(expected, z)
+    
+    def test_map_autograd_simple(self):
+        def f(x, y):
+            return x.sin() + y.cos()
+
+        xs = torch.ones(3, 2, 2, requires_grad=True)
+        y = torch.ones(2, requires_grad=True)
+        res = control_flow.map(f, xs, y)
+        grads = torch.autograd.grad(res, (xs, y), torch.ones_like(res))
+        print("final_grads", grads)
+
+    def test_map_autograd_pytree(self):
+        import torch.utils._pytree as pytree
+        def f(x, y):
+            return {'a': x[0]['a'] * y, 'b': (x[1][0]['c'] * x[1][1]['d'], )}
+
+        def true_map(x, y):
+            z = control_flow.map(f, x, y)
+            flat_x, _ = pytree.tree_flatten(x)
+            flat_z, _ = pytree.tree_flatten(z)
+            grads = torch.autograd.grad(flat_z, flat_x, [torch.ones_like(z, requires_grad=True) for z in flat_z], allow_unused=True)
+            return grads
+
+        def fake_map(x, y):
+            z = control_flow.map(f, x, y)
+            flat_x, _ = pytree.tree_flatten(x)
+            flat_z, _ = pytree.tree_flatten(z)
+            grads = torch.autograd.grad(flat_z, flat_x, [torch.ones_like(z, requires_grad=True) for z in flat_z], allow_unused=True)
+            return grads
+
+        x = ({'a': torch.ones(3, 2, 2, requires_grad=True)}, ({'c': torch.ones(3, 1, requires_grad=True)}, {'d': torch.ones(3, 2, requires_grad=True)}))
+        y = torch.ones(1, requires_grad=False)
+        true_map_grads = true_map(x, y)
+        print(true_map_grads)
+        #fake_map_grads = fake_map(xs, y, z)
+        #self.assertEqual(true_map_grads, fake_map_grads)
+        print("eager done!")
+    #    #true_gm = make_fx(true_map)(xs, y, z)
+    #    #true_gm.print_readable()
+    #    #true_gm_grads = true_gm(xs, y, z)
+    #    #print(true_gm_grads, fake_map_grads)
+    #    #self.assertEqual(true_gm_grads, fake_map_grads)
 
 
 class TestControlFlowTraced(TestCase):
@@ -606,6 +657,7 @@ class TestControlFlowTraced(TestCase):
         res = gm(x, y)
         self.assertEqual(res, g(x, y))
         self.check_map_graph(gm, "val")
+        gm.print_readable()
 
     def test_map_functionalized(self):
         def map_fn(x, y):

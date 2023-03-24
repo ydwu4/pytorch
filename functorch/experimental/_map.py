@@ -23,6 +23,35 @@ from ._cond import _has_potential_branch_input_alias, _has_potential_branch_inpu
 
 map = PyOperator("map")
 
+class MapAutogradOp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, f, args_spec, *flat_args):
+        ctx.save_for_backward(*flat_args)
+        ctx._f = f
+        ctx._args_spec = args_spec
+        xs, args = pytree.tree_unflatten(flat_args, args_spec)
+        out = map(f, xs, *args)
+        flat_out, out_spec =  pytree.tree_flatten(out)
+        return out_spec, *flat_out
+    
+    @staticmethod
+    def backward(ctx, grad_spec, *flat_grads):
+        xs, args = pytree.tree_unflatten(ctx.saved_tensors, ctx._args_spec)
+        def fw_bw(grad_out_and_x, *args):
+            flat_grads, x = grad_out_and_x 
+            with torch.enable_grad():
+                # Since x and flat_grads are created in map_cpu, where autograd is disabled.
+                # We create a view of args to allow autograd through them.
+                x, args = pytree.tree_map(lambda t: t.view(t.shape), (x, args))
+                out = ctx._f(x, *args)
+            flat_out, _ = pytree.tree_flatten(out)
+            def grad(arg):
+                if arg.requires_grad:
+                    return torch.autograd.grad(flat_out, arg, flat_grads, retain_graph=True)[0]
+                return None
+            return pytree.tree_map(grad, (x, *args))
+        grads = map(fw_bw, (flat_grads, xs), *args)
+        return None, None, *pytree.tree_flatten(grads)[0]
 
 def trace_map(proxy_mode, func_overload, f, xs, *args):
     if not isinstance(xs, torch.Tensor):
@@ -58,27 +87,57 @@ def trace_map(proxy_mode, func_overload, f, xs, *args):
     out.copy_(torch.stack(outs))
     return track_tensor_tree(out, out_proxy, constant=None, tracer=proxy_mode.tracer)
 
+def _unstack_pytree(xs):
+    flat_xs, inspec = pytree.tree_flatten(xs)
+    assert all([isinstance(xs, torch.Tensor) for xs in flat_xs]), f"Leaves of xs must be Tensor {flat_xs}"
+    assert all([xs.shape[0] == flat_xs[0].shape[0] for xs in flat_xs]), f"Leaves of xs must have same leading dimension size {flat_xs}"
+    a = list(zip(*flat_xs))
+    pytrees = []
+    for tuple in a:
+        pytrees.append(pytree.tree_unflatten(tuple, inspec))
+    return pytrees
 
-@map.py_impl(DispatchKey.CompositeExplicitAutograd)
+def _stack_pytree(pytrees):
+    flat_out = []
+    out_spec = None
+    for pt in pytrees:
+        flat_pt, out_spec = pytree.tree_flatten(pt)
+        flat_out.append(flat_pt)
+    b = list(zip(*flat_out))
+    stacked_out = []
+    for leaves in b:
+        if all([leave is not None for leave in leaves]):
+            stacked_out.append(torch.stack(leaves))
+        else:
+            stacked_out.append(None)
+    return pytree.tree_unflatten(stacked_out, out_spec)
+
+@map.py_impl(DispatchKey.CUDA)
+@map.py_impl(DispatchKey.CPU)
 def map_cpu(f, xs, *args):
     mode = _get_current_dispatch_mode()
     assert (mode is None), "Mode should never be enabled for CPU/CUDA key"
-    return torch.stack([f(x, *args) for x in xs])
+    return _stack_pytree(f(_unstack_pytree(xs), *args))
 
 
 @map.py_impl(DispatchKey.Autograd)
 def map_autograd(f, xs, *args):
-    # TODO: support autograd
-    flat_operands, _ = tree_flatten([f, xs, args])
-    assert all([not f.requires_grad for f in flat_operands
-                if isinstance(f, torch.Tensor)])
-
-    _ = ExcludeDispatchKeyGuard(DispatchKeySet(DispatchKey.AutogradCPU))
-    return map(f, xs, *args)
+    # We want to only disable Autograd for map because we need to autograd f in map.
+    # This seems to prohibit autograd nested map.
+    map.non_fallthrough_keys = map.non_fallthrough_keys.remove(DispatchKey.AutogradCPU)
+    map.non_fallthrough_keys = map.non_fallthrough_keys.remove(DispatchKey.AutogradCUDA)
+    # Autograd.Function can only handle flattend inputs and produce flattend outputs.
+    flat_args, args_spec = pytree.tree_flatten((xs, args))
+    out_spec, *flat_outs= MapAutogradOp.apply(f, args_spec, *flat_args)
+    outs = pytree.tree_unflatten(flat_outs, out_spec)
+    map.non_fallthrough_keys = map.non_fallthrough_keys.add(DispatchKey.AutogradCPU)
+    map.non_fallthrough_keys = map.non_fallthrough_keys.add(DispatchKey.AutogradCUDA)
+    return outs
 
 
 @map.py_impl(ProxyTorchDispatchMode)
 def map_proxy_torch_dispatch_mode(f, xs, *args):
+    print("map forward proxy torch dispatch")
     mode = _get_current_dispatch_mode()
     assert (mode is not None), "Mode should always be enabled for python fallback key"
     with _pop_mode_temporarily() as mode:
@@ -88,17 +147,13 @@ def map_proxy_torch_dispatch_mode(f, xs, *args):
 
 @map.py_impl(FakeTensorMode)
 def map_fake_tensor_mode(f, xs, *args):
+    print("map_fake_tensor")
     outs = [f(x, *args) for x in xs]
     return outs[0].new_empty([xs.shape[0], *outs[0].shape])
 
-# We cannot directly call fallthrough here due to issue #89037.
-@map.py_impl(DispatchKey.PythonDispatcher)
-def map_python_dispatcher(*args):
-    _ = ExcludeDispatchKeyGuard(DispatchKeySet(DispatchKey.PythonDispatcher))
-    return map(*args)
-
 @map.py_impl(torch._C._functorch.TransformType.Functionalize)
 def map_functionalize(interpreter, f, xs, *args):
+    print("map_functionalize")
     """
     Functionalization implementation for torch.map. Currently:
       1. We don't allow any input mutation inside the map function
@@ -128,6 +183,7 @@ def map_functionalize(interpreter, f, xs, *args):
         return _wrap_all_tensors_to_functional(map_return, level=interpreter.level())
 
 # TODO(voz) Make this automatic for keys, this is very ugly atm
+map.fallthrough(DispatchKey.PythonDispatcher)
 map.fallthrough(DispatchKey.PythonTLSSnapshot)
 map.fallthrough(DispatchKey.ADInplaceOrView)
 map.fallthrough(DispatchKey.BackendSelect)
