@@ -24,10 +24,10 @@ def _fake_map(f, x, *args):
 class TestControlFlow(TestCase):
     def test_cond_no_trace(self):
         def true_fn(x):
-            return x.sin()
+            return x[0].sin()
 
         def false_fn(x):
-            return x.cos()
+            return x[0].cos()
 
         x = torch.randn(4)
         result = cond(False, true_fn, false_fn, [x])

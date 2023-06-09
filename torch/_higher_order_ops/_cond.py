@@ -34,7 +34,33 @@ class UnsupportedAliasMutationException(RuntimeError):
 We're going to define a `cond` operation.
 In order to do this, we need implementations for each of the dispatch keys.
 """
-cond = HigherOrderOperator("cond")
+class Cond(HigherOrderOperator):
+    def __call__(self, *args, **kwargs):
+        return cond_wrapper(*args, **kwargs)
+cond = Cond("cond") 
+cond_impl = HigherOrderOperator("cond_impl")
+
+# TODO(yidi): factor it out as a utility function
+def make_flat_fn(fn, in_spec):
+    out_spec = None
+    def flat_fn(*args):
+        fn_args = pytree.tree_unflatten(args, in_spec)
+        flat_out, tmp_out_spec = pytree.tree_flatten(fn(*fn_args))
+        nonlocal out_spec
+        out_spec = tmp_out_spec
+        return flat_out
+    breakpoint()
+    return flat_fn, out_spec
+
+def cond_wrapper(pred, true_fn, false_fn, *operands):
+    # Validate inputs
+    flat_operands, in_spec = pytree.tree_flatten(operands)
+    flat_true_fn, true_out_spec = make_flat_fn(true_fn, in_spec)
+    flat_false_fn, false_out_spec = make_flat_fn(false_fn, in_spec)
+    if true_out_spec != false_out_spec:
+        raise RuntimeError(f"True and false branches returns different pytree output. true_fn:{true_out_spec}, false_fn:{false_out_spec}")
+
+    return pytree.tree_unflatten(cond_impl(pred, flat_true_fn, flat_false_fn, *flat_operands), true_out_spec)
 
 def trace_cond(proxy_mode, func_overload, pred, true_fn, false_fn, operands):
     assert isinstance(operands, (list, tuple)), "Cond operands must be a list or tuple of tensors"
@@ -111,8 +137,8 @@ def trace_cond(proxy_mode, func_overload, pred, true_fn, false_fn, operands):
     return track_tensor_tree(out, out_proxy, constant=None, tracer=proxy_mode.tracer)
 
 
-@cond.py_impl(DispatchKey.CompositeExplicitAutograd)
-def cond_dense(pred, true_fn, false_fn, operands):
+@cond_impl.py_impl(DispatchKey.CompositeExplicitAutograd)
+def cond_dense(pred, true_fn, false_fn, *operands):
     mode = _get_current_dispatch_mode()
     assert (mode is None), "Mode should never be enabled for CPU/CUDA key"
     if pred:
@@ -121,18 +147,13 @@ def cond_dense(pred, true_fn, false_fn, operands):
         return false_fn(*operands)
 
 
-@cond.py_impl(DispatchKey.Autograd)
+@cond_impl.py_impl(DispatchKey.Autograd)
 def cond_autograd(pred, true_fn, false_fn, *operands):
-    # TODO: support autograd
-    flat_operands, _ = tree_flatten([true_fn, false_fn] + [operands])
-    assert all(not f.requires_grad for f in flat_operands
-               if isinstance(f, torch.Tensor))
-
     with _ExcludeDispatchKeyGuard(DispatchKeySet(DispatchKey.AutogradCPU)):
-        return cond(pred, true_fn, false_fn, *operands)
+        return cond_impl(pred, true_fn, false_fn, *operands)
 
 
-@cond.py_impl(ProxyTorchDispatchMode)
+@cond_impl.py_impl(ProxyTorchDispatchMode)
 def inner(pred, true_fn, false_fn, operands):
     mode = _get_current_dispatch_mode()
     assert (mode is not None), "Mode should always be enabled for python fallback key"
@@ -143,7 +164,7 @@ def inner(pred, true_fn, false_fn, operands):
             return cond(pred, true_fn, false_fn, operands)
 
 
-@cond.py_impl(FakeTensorMode)
+@cond_impl.py_impl(FakeTensorMode)
 def cond_fake_tensor_mode(pred, true_fn, false_fn, operands):
     true_outs = true_fn(*operands)
     flat_true_outs, _ = pytree.tree_flatten(true_outs)
@@ -239,7 +260,7 @@ def _has_potential_branch_input_alias(branch, inputs):
     return _detect_input_alias(gm)
 
 
-@cond.py_impl(DispatchKey.Functionalize)
+@cond_impl.py_impl(DispatchKey.Functionalize)
 def cond_func(pred, true_fn, false_fn, inputs):
     reapply_views = torch._C._functionalization_reapply_views_tls()
     unwrapped_inputs = _unwrap_all_tensors_from_functional(inputs, reapply_views=reapply_views)
@@ -261,7 +282,7 @@ def cond_func(pred, true_fn, false_fn, inputs):
         return _wrap_all_tensors_to_functional(cond_return, level=0)
 
 
-@cond.py_impl(torch._C._functorch.TransformType.Functionalize)
+@cond_impl.py_impl(torch._C._functorch.TransformType.Functionalize)
 def cond_functionalize(interpreter, pred, true_fn, false_fn, inputs):
     """
     Functionalization implementation for torch.cond. Currently:
@@ -291,8 +312,8 @@ def cond_functionalize(interpreter, pred, true_fn, false_fn, inputs):
         return _wrap_all_tensors_to_functional(cond_return, level=interpreter.level())
 
 # TODO(voz): Make this automatic for keys, this is very ugly atm
-cond.fallthrough(DispatchKey.PythonDispatcher)
-cond.fallthrough(DispatchKey.PythonTLSSnapshot)
-cond.fallthrough(DispatchKey.ADInplaceOrView)
-cond.fallthrough(DispatchKey.BackendSelect)
-cond.fallthrough(DispatchKey.AutocastCPU)
+cond_impl.fallthrough(DispatchKey.PythonDispatcher)
+cond_impl.fallthrough(DispatchKey.PythonTLSSnapshot)
+cond_impl.fallthrough(DispatchKey.ADInplaceOrView)
+cond_impl.fallthrough(DispatchKey.BackendSelect)
+cond_impl.fallthrough(DispatchKey.AutocastCPU)
