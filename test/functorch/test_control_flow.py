@@ -32,6 +32,24 @@ class TestControlFlow(TestCase):
         x = torch.randn(4)
         result = cond(False, true_fn, false_fn, [x])
         self.assertEqual(result, torch.cos(x))
+    
+    def test_cond_pytree_in_out(self):
+        def true_fn(x):
+            return [x[0]["a"].sin(), {"res": x[1].cos()}]
+        
+        def false_fn(x):
+            return [x[0]["a"].cos(), {"res": x[1].sin()}]
+        
+        a = torch.randn(4)
+        b = torch.randn(4)
+        pytree_x = [{"a": a}, b]
+        true_result = cond(True, true_fn, false_fn, pytree_x)
+        false_result = cond(False, true_fn, false_fn, pytree_x)
+        self.assertEqual(true_result[0], a.sin())
+        self.assertEqual(false_result[0], a.cos())
+        self.assertEqual(true_result[1]["res"], b.cos())
+        self.assertEqual(false_result[1]["res"], b.sin())
+
 
     @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA.")
     def test_cond_gpu(self):

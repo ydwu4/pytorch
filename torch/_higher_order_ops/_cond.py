@@ -40,25 +40,24 @@ class Cond(HigherOrderOperator):
 cond = Cond("cond") 
 cond_impl = HigherOrderOperator("cond_impl")
 
-# TODO(yidi): factor it out as a utility function
 def make_flat_fn(fn, in_spec):
-    out_spec = None
     def flat_fn(*args):
         fn_args = pytree.tree_unflatten(args, in_spec)
-        flat_out, tmp_out_spec = pytree.tree_flatten(fn(*fn_args))
-        nonlocal out_spec
-        out_spec = tmp_out_spec
+        flat_out, _ = pytree.tree_flatten(fn(*fn_args))
         return flat_out
-    breakpoint()
-    return flat_fn, out_spec
+    return flat_fn
+
 
 def cond_wrapper(pred, true_fn, false_fn, *operands):
     # Validate inputs
     flat_operands, in_spec = pytree.tree_flatten(operands)
-    flat_true_fn, true_out_spec = make_flat_fn(true_fn, in_spec)
-    flat_false_fn, false_out_spec = make_flat_fn(false_fn, in_spec)
+    _, true_out_spec = pytree.tree_flatten(true_fn(*operands))
+    _, false_out_spec = pytree.tree_flatten(false_fn(*operands))
     if true_out_spec != false_out_spec:
         raise RuntimeError(f"True and false branches returns different pytree output. true_fn:{true_out_spec}, false_fn:{false_out_spec}")
+
+    flat_true_fn = make_flat_fn(true_fn, in_spec)
+    flat_false_fn = make_flat_fn(false_fn, in_spec)
 
     return pytree.tree_unflatten(cond_impl(pred, flat_true_fn, flat_false_fn, *flat_operands), true_out_spec)
 
