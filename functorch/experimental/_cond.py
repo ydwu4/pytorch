@@ -25,16 +25,35 @@ from torch.utils._pytree import tree_flatten
 from torch._dynamo.exc import CondOpArgsMismatchError
 
 
-@dataclass
-class UnsupportedAliasMutationException(RuntimeError):
-    reason: str
-
-
 """
 We're going to define a `cond` operation.
 In order to do this, we need implementations for each of the dispatch keys.
 """
 cond = HigherOrderOperator("cond")
+
+@dataclass
+class UnsupportedAliasMutationException(RuntimeError):
+    reason: str
+
+def torch_cond(pred, true_fn, false_fn, operands):
+    class EagerAndRecordGraphs:
+        def __init__(self):
+            self.graphs = []
+
+        def __call__(self, gm: torch.fx.GraphModule, example_inputs):
+            self.graphs.append(gm)
+            return gm
+
+    from torch._dynamo.testing import CompileCounterWithBackend
+
+    backend = EagerAndRecordGraphs()
+    cnt = CompileCounterWithBackend(backend)
+    if torch._dynamo.is_compiling():
+        return cond(pred, true_fn, false_fn, operands)
+    else:
+        def wrapper(*args, **kwargs):
+            return cond(*args, **kwargs)
+        return torch.compile(wrapper, backend=cnt)(pred, true_fn, false_fn, operands)
 
 def trace_cond(proxy_mode, func_overload, pred, true_fn, false_fn, operands):
     assert isinstance(operands, (list, tuple)), "Cond operands must be a list or tuple of tensors"

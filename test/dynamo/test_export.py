@@ -3077,6 +3077,41 @@ def forward(self, x):
         gm, _ = torch._dynamo.export(M(), torch.ones(6, 4), aten_graph=False)
         self.assertEqual(gm(torch.ones(6, 4)), M()(torch.ones(6, 4)))
         self.assertEqual(gm(torch.ones(3, 4)), M()(torch.ones(3, 4)))
+    
+    def test_cond_eager_mode_param_lifting(self):
+        from functorch.experimental._cond import torch_cond
+        class A(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("buffer1", torch.zeros(6, 4))
+
+            def forward(self):
+                return self.buffer1.sum()
+
+        class B(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("buffer2", torch.ones(6, 4))
+
+            def forward(self):
+                return self.buffer2.sum()
+
+        a = A()
+        b = B()
+        def cond_fn(x):
+            def true_fn(x):
+                return x.cos() + a()
+
+            def false_fn(x):
+                return x.sin() + b()
+
+            return (torch_cond(x.shape[0] > 4, true_fn, false_fn, [x]),)
+        
+        def test_fn():
+            return cond_fn(torch.ones(6, 4))
+        
+        print(test_fn())
+
 
     def test_nested_cond_op_param_buffer_lifted(self):
         class A(torch.nn.Module):

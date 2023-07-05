@@ -154,6 +154,10 @@ FILENAME_ALLOWLIST |= {
     _module_dir(torch) + "_functorch/apis.py",
 }
 
+FILENAME_ALLOWLIST |= {
+    "/scratch/yidi/work/pytorch/functorch/experimental/_cond.py",
+}
+
 SKIP_DIRS_RE = None
 
 is_fbcode = importlib.import_module("torch._inductor.config").is_fbcode()
